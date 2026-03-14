@@ -4,13 +4,13 @@
 
 This program was a student project I wrote for my Microprocessor Lab course in undergrad. I really enjoyed that class, and realized that I wanted very much to work on embedded systems in my future.
 
-At this time, I was living and working on a student-run farm at the university, where I had taken a special interest in the solar thermal array and greenhouse. A problem we frequently had on the farm was that the greenhouse was getting much warmer than needed, and we often covered the solar thermal array with a blanket to prevent more heat absorpbtion. I imagined it would be far better if we could have the blanket on a furling system with a motor, such that some basic control system could be implemented to automatically manage the solar energy input into the system.
+At the time, I was living and working on a student-run farm at the university, where I had taken a special interest in the solar thermal array and greenhouse. A problem we frequently had on the farm was that the greenhouse was getting much warmer than needed, so we often covered the solar thermal array with a blanket to prevent more heat absorpbtion. I imagined it would be far better if we could have the blanket on a furling system with a motor, such that some basic control system could be implemented to automatically manage the solar energy input into the system.
 
-Well, I never got that far, but I did make a small demo of that idea for Microprocessor Lab. This project is that demo.
+Well, I never did implement that system, but I did make a small demo of the idea for Microprocessor Lab. This project is that demo.
 
 ## Construction
 
-The physical system was very simple, being comprised of a shallow cardboard box inclined at an angle, a lid which could be pulled up or slid down to open/close the box, and a motor mounted on a tower with a pulley controlling the height of the lid. Mounted inside the box were four photoresistors, spanning the height of the box.
+The physical system was very simple, being comprised of a shallow cardboard box inclined at an angle, a lid which could be pulled up or slid down to open/close the box, and a motor mounted on a tower with a pulley controlling the height of the lid. Mounted inside the box were four photoresistors, equally spaced along the height of the box.
 
 The remaining electronics were off to the side of the box, and were the microcontroller, a stepper motor driver board, a joystick, a 16x2 LCD, and four resistors pairing with the photoresistors to form voltage dividers.
 
