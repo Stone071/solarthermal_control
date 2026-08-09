@@ -21,11 +21,15 @@
 #include "portmacro.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "semphr.h"
 
 // DEFINES
 // We can use the same priority as the idle task, a define controls
 // how idle and this task collide.
-#define mainBLINK_TASK_PRIORITY (tskIDLE_PRIORITY)
+#define mainLCD_UPDATE_TASK_PRIORITY  (tskIDLE_PRIORITY)
+#define mainJOYSTICK_TASK_PRIORITY    (tskIDLE_PRIORITY+1)
+#define mainADC_READ_TASK_PRIORITY    (tskIDLE_PRIORITY+2)
+#define mainRUN_MOTOR_TASK_PRIORITY   (tskIDLE_PRIORITY+3) // higher is greater priority
 // I2C communication
 #define JOY_ADDR  0x20 // i2c addr
 #define X_REG     0x03 // i2c registers
@@ -42,7 +46,6 @@
 #define IN4 PORTD4  // motor step pins
 // Photosensor Related
 #define ERR_TOL 0.1 // photosensor voltage tolerance
-#define ADC_DELAY 200 // ADC read delay
 // User Interface
 #define NAVIGATING_MENUS    0 // Values for uiState
 #define ADJ_SHADE_POS       1 // Values for uiState
@@ -50,31 +53,34 @@
 #define POSITIVE_LEAN 192 // joystick sensitivity
 #define NEGATIVE_LEAN  64 // joystick sensitivity
 #define JOY_CLICKED     0 // joystick toggle
-#define JOY_DEBOUNCE  500 // Joystick read timer
+#define JOY_DEBOUNCE  pdMS_TO_TICKS(250) // Joystick read timer
+// System Mode
+#define SYS_MODE_AUTO    0
+#define SYS_MODE_MANUAL  1
 // LCD
 #define MAX_HORIZ_POS  15 // LCD position limit
 #define MAX_VERT_POS    1 // LCD position limit
 
 // DATA TYPES
-typedef enum {AUTO, MANUAL} controlMode; // controlMode can have value AUTO or MANUAL
 struct CursorPos {
     uint8_t x;
     uint8_t y;
 };
 
 // GLOBALS
-controlMode sysMode = MANUAL; // The overall control mode
-static uint8_t uiState = NAVIGATING_MENUS; // The state of the ui
+uint8_t sysMode = SYS_MODE_AUTO; // The overall control mode
+uint8_t uiState = NAVIGATING_MENUS; // The state of the ui
 const struct CursorPos cursorControlModePosition = {7,1};
 const struct CursorPos cursorAdjustPosition = {9,0};
 uint8_t lcdPosX = 0;
 uint8_t lcdPosY = 0;
 float photocellVoltage;
 uint8_t voltageSetpoint = 0;
-volatile uint16_t adcReadTimer;
-volatile bool adcReadFlag;
-volatile bool lcdUpdateFlag;
 uint16_t debounceTime;
+uint8_t ucManualRun = 0;
+// Resource Protection
+StaticSemaphore_t xPhotocellVoltageMutexBuffer;
+SemaphoreHandle_t xPhotocellVoltageMutex;
 // All text used for display
 const unsigned char voltageMsg[] = "V: ";
 const unsigned char controlMsg[] = "Cntrl: ";
@@ -145,17 +151,55 @@ void StepMotor(int direction)
     PORTD |= stepTable[stepIndex];
 }
 
-// AutoMotorTask steps the motor to minimize the photocell feedback signal
-void AutoMotorTask(void)
+// vMotorTask steps the motor
+void vMotorTask(void* pvParameters)
 {
-    // Photocells are being used in a voltage divider setup such that more light
-    // creates a higher measured voltage.
-    float err = voltageSetpoint - photocellVoltage; // Compute difference.
-    if (fabs(err) > ERR_TOL)
+    // Functional
+    float flCellVoltage;
+    float flErrSig;
+    // Timing
+    TickType_t xLastWakeTime;
+    const TickType_t xTicksToGo = pdMS_TO_TICKS(10); // run the motor on a 10ms period
+    xLastWakeTime = xTaskGetTickCount();
+    // Recurrent execution
+    for (;;)
     {
-        if (err > 0) StepMotor(STEP_CCW); // not enough light, open the shutter
-        else if (err < 0) StepMotor(STEP_CW); // too much light, close the shutter
-    }
+        if (sysMode == SYS_MODE_MANUAL)
+        {
+            // Reading ucManualRun is atomic. No need for mutex.
+            if (ucManualRun == STEP_CCW) StepMotor(STEP_CCW);
+            else if (ucManualRun == STEP_CW) StepMotor(STEP_CW);
+        }
+        else if (sysMode == SYS_MODE_AUTO)
+        {
+            // Retrieve the current photocell voltage and setpoint
+            if (xPhotocellVoltageMutex != NULL)
+            {
+                if (xSemaphoreTake(xPhotocellVoltageMutex, 0) == pdPASS)
+                {
+                    // Read of photocellVoltage is NOT atomic
+                    flCellVoltage = photocellVoltage;
+                    xSemaphoreGive(xPhotocellVoltageMutex); // Call shouldn't fail
+
+                    // Compute the error signal and adjust run the motor
+                    // Photocells are being used in a voltage divider setup such that more light
+                    // creates a higher measured voltage.
+                    flErrSig = voltageSetpoint - flCellVoltage; // Compute difference.
+                    if (fabs(flErrSig) > ERR_TOL)
+                    {
+                        if (flErrSig > 0) StepMotor(STEP_CCW); // not enough light, open the shutter
+                        else if (flErrSig < 0) StepMotor(STEP_CW); // too much light, close the shutter
+                    }
+                }
+            }
+            else
+            {
+                // nothing, mutex does not exist for some reason
+            }
+        } // end sysMode == SYS_MODE_AUTO
+
+        xTaskDelayUntil(&xLastWakeTime, xTicksToGo);
+    } // end for(;;)
 }
 
 // TwiMasterInit configures registers for I2C operation
@@ -219,94 +263,116 @@ bool CheckCursorPos(struct CursorPos desiredPosition)
 }
 
 // JoystickTask operates a state machine to handle user input via the joystick
-void JoystickTask(void)
+void vJoystickTask(void* pvParams)
 {
-    // Reading in X,Y, and click of joystick.
-    uint8_t joyHoriz = TwiRead(JOY_ADDR, X_REG);
-    uint8_t joyVert = TwiRead(JOY_ADDR, Y_REG);
-    uint8_t click = TwiRead(JOY_ADDR, CLICK_REG);
-    // Save the position of the cursor from the previous call
-    uint8_t tempX = lcdPosX;
-    uint8_t tempY = lcdPosY;
-
-    switch(uiState)
+    // Functional
+    uint8_t joyHoriz;
+    uint8_t joyVert;
+    uint8_t click;
+    uint8_t tempX;
+    uint8_t tempY;
+    // Timing
+    TickType_t xLastWakeTime;
+    const TickType_t xTicksToGo = pdMS_TO_TICKS(50); // Check the joystick on a 50ms period
+    xLastWakeTime = xTaskGetTickCount();
+    // Recurrent Execution
+    for(;;)
     {
-        case NAVIGATING_MENUS:
+        // Reading in X,Y, and click of joystick.
+        joyHoriz = TwiRead(JOY_ADDR, X_REG);
+        joyVert = TwiRead(JOY_ADDR, Y_REG);
+        click = TwiRead(JOY_ADDR, CLICK_REG);
+        // Save the position of the cursor from the previous call
+        tempX = lcdPosX;
+        tempY = lcdPosY;
+        if (debounceTime >= xTicksToGo)
         {
-            // Joystick controls cursor position, SM monitors for clicks on known menu positions
-            if (debounceTime == 0)
-            {
-                UpdateCursorPos(joyHoriz, joyVert); // Updates lcdPosX and lcdPosY
-                if (tempX != lcdPosX || tempY  != lcdPosY) 
-                {
-                    debounceTime = JOY_DEBOUNCE; // debounce if moved
-                    LcdGoToXY(lcdPosX,lcdPosY);  // Send the LCD cursor to the new position.
-                }
-                else if (click == JOY_CLICKED)
-                {
-                    debounceTime = JOY_DEBOUNCE;
-                    if (CheckCursorPos(cursorControlModePosition))
-                    {
-                        sysMode = (sysMode == AUTO) ? MANUAL : AUTO; // Change to other mode
-                        LcdClear();
-                    }
-                    else if (CheckCursorPos(cursorAdjustPosition))
-                    {
-                        uiState = (sysMode == AUTO) ? ADJ_BRIGHT_SETPOINT : ADJ_SHADE_POS;
-                        LcdClear();
-                    }
-                }
-            }
-            break;
+            debounceTime -= xTicksToGo;
         }
-        case ADJ_SHADE_POS:
+
+        switch(uiState)
         {
-            // Exiting manual adjustment
-            if (click == JOY_CLICKED && debounceTime == 0)
+            case NAVIGATING_MENUS:
             {
-                // return to navigating menus
-                debounceTime = JOY_DEBOUNCE;
-                LcdClear(); // clear LCD for menu change
-                uiState = NAVIGATING_MENUS;
-            }
-            // Joystick controls shade position directly
-            else
-            {
-                // if joystick up, curtain up
-                if (joyVert > POSITIVE_LEAN) StepMotor(STEP_CCW);
-                // if joystick down, curtain down
-                else if (joyVert < NEGATIVE_LEAN) StepMotor(STEP_CW);
-            }
-            break;
-        }
-        case ADJ_BRIGHT_SETPOINT:
-        {
-            // all actions in here should be debounced
-            if (debounceTime == 0)
-            {
-                // User exiting menu
-                if (click == JOY_CLICKED)
+                // Joystick controls cursor position, SM monitors for clicks on known menu positions
+                if (debounceTime == 0)
                 {
+                    UpdateCursorPos(joyHoriz, joyVert); // Updates lcdPosX and lcdPosY
+                    if (tempX != lcdPosX || tempY  != lcdPosY) 
+                    {
+                        debounceTime = JOY_DEBOUNCE; // debounce if moved
+                        LcdGoToXY(lcdPosX,lcdPosY);  // Send the LCD cursor to the new position.
+                    }
+                    else if (click == JOY_CLICKED)
+                    {
+                        debounceTime = JOY_DEBOUNCE;
+                        if (CheckCursorPos(cursorControlModePosition))
+                        {
+                            sysMode = (sysMode == SYS_MODE_AUTO) ? SYS_MODE_MANUAL : SYS_MODE_AUTO; // Change to other mode
+                            LcdClear();
+                        }
+                        else if (CheckCursorPos(cursorAdjustPosition))
+                        {
+                            uiState = (sysMode == SYS_MODE_AUTO) ? ADJ_BRIGHT_SETPOINT : ADJ_SHADE_POS;
+                            LcdClear();
+                        }
+                    }
+                }
+                break;
+            }
+            case ADJ_SHADE_POS:
+            {
+                // Exiting manual adjustment
+                if (click == JOY_CLICKED && debounceTime == 0)
+                {
+                    // return to navigating menus
                     debounceTime = JOY_DEBOUNCE;
-                    LcdClear();
+                    LcdClear(); // clear LCD for menu change
                     uiState = NAVIGATING_MENUS;
                 }
-                // Joystick controlling voltageSetpoint for automatic shade operation
-                else if (joyHoriz > POSITIVE_LEAN)
+                // Joystick controls signals motor to run
+                else
                 {
-                    // Allow user to thumb through numbers 1-5 as setpoints.
-                    if (voltageSetpoint < 5) voltageSetpoint++; // Don't go above 5.
-                    debounceTime = JOY_DEBOUNCE;
+                    // Assignment to 8bit ucManualRun is atomic. No need to mutex.
+                    // if joystick up, curtain up
+                    if (joyVert > POSITIVE_LEAN) ucManualRun = STEP_CCW;
+                    // if joystick down, curtain down
+                    else if (joyVert < NEGATIVE_LEAN) ucManualRun = STEP_CW;
+                    else ucManualRun = 0;
                 }
-                else if (joyHoriz < NEGATIVE_LEAN)
-                {
-                    if (voltageSetpoint > 0) voltageSetpoint--; // Don't go below 0.
-                    debounceTime = JOY_DEBOUNCE;
-                }
+                break;
             }
-            break;
+            case ADJ_BRIGHT_SETPOINT:
+            {
+                // all actions in here should be debounced
+                if (debounceTime == 0)
+                {
+                    // User exiting menu
+                    if (click == JOY_CLICKED)
+                    {
+                        debounceTime = JOY_DEBOUNCE;
+                        LcdClear();
+                        uiState = NAVIGATING_MENUS;
+                    }
+                    // Joystick controlling voltageSetpoint for automatic shade operation
+                    else if (joyHoriz > POSITIVE_LEAN)
+                    {
+                        // Allow user to thumb through numbers 1-5 as setpoints.
+                        if (voltageSetpoint < 5) voltageSetpoint++; // Don't go above 5.
+                        debounceTime = JOY_DEBOUNCE;
+                    }
+                    else if (joyHoriz < NEGATIVE_LEAN)
+                    {
+                        if (voltageSetpoint > 0) voltageSetpoint--; // Don't go below 0.
+                        debounceTime = JOY_DEBOUNCE;
+                    }
+                }
+                break;
+            }
         }
-    }
+
+        xTaskDelayUntil(&xLastWakeTime, xTicksToGo);
+    } // end for(;;)
 }
 
 // InitAdc initializes the on board ADC
@@ -328,113 +394,148 @@ uint16_t ReadAdcChannel(uint8_t channel)
     return ADC;
 }
 
-// ReadAdc reads the four photocells and returns the average in volts
-float ReadAdc(void)
+// ReadAdcTask reads the four photocells and returns the average in volts
+void vReadAdcTask(void* pvParameters)
 {
+    // Functional
     uint16_t sum = 0; // ADC has 10 bit precision
     uint8_t i;
     float avg;
-    // Sum the reading across 4 photocells
-    for (i = 0; i < 4; i++)
+    // Timing
+    TickType_t xLastWakeTime;
+    const TickType_t xTicksToGo = pdMS_TO_TICKS(5); // Read the voltage on a 5ms period
+    xLastWakeTime = xTaskGetTickCount();
+    // Recurrent execution
+    for (;;)
     {
-        sum += ReadAdcChannel(i);
-    }
-    avg = sum/4.00;
-    // Return the average in terms of voltage across cells
-    return ((float)avg/1023.00)*5.00;
+        sum = 0;
+        avg = 0;
+        // Sum the reading across 4 photocells
+        for (i = 0; i < 4; i++)
+        {
+            sum += ReadAdcChannel(i);
+        }
+        avg = sum/4.00;
+        // Save the average in terms of voltage across cells
+        if (xPhotocellVoltageMutex != NULL)
+        {
+            if (xSemaphoreTake(xPhotocellVoltageMutex, 0) == pdPASS)
+            {
+                // Assignment to float is NOT atomic.
+                photocellVoltage = ((float)avg/1023.00)*5.00;
+                xSemaphoreGive(xPhotocellVoltageMutex);
+            }
+        }
+        else
+        {
+            // mutex did not exist
+        }
+
+        xTaskDelayUntil(&xLastWakeTime, xTicksToGo);
+    } // end for(;;)
 }
 
-// UserInterfaceTask operates a state machine to display all needed prompts on the LCD
-void UserInterfaceTask(void)
+// LcdUpdateTask operates a state machine to display all needed prompts on the LCD
+void vLcdUpdateTask(void* pvParameters)
 {
+    // Functional
     char charBuf[4];
-
-    // Display is dependent on uiState and sysMode
-    switch (uiState)
+    // Timing
+    TickType_t xLastWakeTime;
+    const TickType_t xTicksToGo = pdMS_TO_TICKS(50); // Update the LCD on a 50ms period
+    xLastWakeTime = xTaskGetTickCount();
+    // Recurrent Execution
+    for (;;)
     {
-        case NAVIGATING_MENUS:
+        // Display is dependent on uiState and sysMode
+        switch (uiState)
         {
-            // Display "V: " at specified position
-            LcdFlashString(voltageMsg,0,0);
-            // Convert photocellVoltage to string and copy to display
-            dtostrf(photocellVoltage,4,3,charBuf);
-            LcdString(charBuf,4);
-            if (sysMode == MANUAL)
+            case NAVIGATING_MENUS:
             {
-                //################
-                //V:x.xxx   Adjust
-                //Cntrl: Manual
-                //################
-                LcdFlashString(adjMsg,9,0);
-                LcdFlashString(controlMsg,0,1);
-                LcdString("Manual",6);
+                // Display "V: " at specified position
+                LcdFlashString(voltageMsg,0,0);
+                // Convert photocellVoltage to string and copy to display
+                dtostrf(photocellVoltage,4,3,charBuf);
+                LcdString(charBuf,4);
+                if (sysMode == SYS_MODE_MANUAL)
+                {
+                    //################
+                    //V:x.xxx   Adjust
+                    //Cntrl: Manual
+                    //################
+                    LcdFlashString(adjMsg,9,0);
+                    LcdFlashString(controlMsg,0,1);
+                    LcdString("Manual",6);
+                }
+                else if (sysMode == SYS_MODE_AUTO)
+                {
+                    //################
+                    //V:x.xxx   Set:y
+                    //Cntrl: Auto
+                    //################
+                    LcdFlashString(setpointMsg,9,0);
+                    dtostrf(voltageSetpoint,1,0,charBuf);
+                    LcdString(charBuf,1);
+                    LcdFlashString(controlMsg,0,1);
+                    LcdString("Auto",4);
+                }
+                break;
             }
-            else if (sysMode == AUTO)
+            case ADJ_SHADE_POS:
             {
                 //################
-                //V:x.xxx   Set:y
-                //Cntrl: Auto
+                //Adj shade with
+                //joystick.
                 //################
-                LcdFlashString(setpointMsg,9,0);
+                LcdFlashString(motorAdjMsgOne,0,0);
+                LcdFlashString(motorAdjMsgTwo,0,1);
+                break;
+            }
+            case ADJ_BRIGHT_SETPOINT:
+            {
+                //################
+                //Setpoint: x y z
+                //
+                //################
+                LcdFlashString(setpointMsg,0,0);
+                // Convert num to str and copy to display
                 dtostrf(voltageSetpoint,1,0,charBuf);
+                LcdGoToXY(7,0);
                 LcdString(charBuf,1);
-                LcdFlashString(controlMsg,0,1);
-                LcdString("Auto",4);
+                // Below we are creating a rotating display of numbers 1-5 the user can thumb through.
+                // Example "Setpoint: 2 3 4" where prevVal = 2, voltageSetpoint = 3, nextVal = 4.
+                if (voltageSetpoint > 0)
+                {
+                    // only create the previous value if voltageSetpoint is 1 or greater.
+                    uint8_t prevVal = voltageSetpoint - 1;
+                    dtostrf(prevVal,1,0,charBuf);
+                    LcdGoToXY(5,0);
+                    LcdString(charBuf,1);
+                }
+                else
+                {
+                    LcdGoToXY(5,0);
+                    LcdString(" ",1); // Clear the space if voltageSetpoint == 0.
+                }
+                if (voltageSetpoint < 5)
+                {
+                    // only create the next value if voltageSetpoint is 4 or lesser.
+                    uint8_t nextVal = voltageSetpoint + 1;
+                    dtostrf(nextVal,1,0,charBuf);
+                    LcdGoToXY(9,0);
+                    LcdString(charBuf,1);
+                }
+                else
+                {
+                    LcdGoToXY(9,0);
+                    LcdString(" ",1); // Clear the space if voltageSetpoint == 5.
+                }
+                break;
             }
-            break;
         }
-        case ADJ_SHADE_POS:
-        {
-            //################
-            //Adj shade with
-            //joystick.
-            //################
-            LcdFlashString(motorAdjMsgOne,0,0);
-            LcdFlashString(motorAdjMsgTwo,0,1);
-            break;
-        }
-        case ADJ_BRIGHT_SETPOINT:
-        {
-            //################
-            //Setpoint: x y z
-            //
-            //################
-            LcdFlashString(setpointMsg,0,0);
-            // Convert num to str and copy to display
-            dtostrf(voltageSetpoint,1,0,charBuf);
-            LcdGoToXY(7,0);
-            LcdString(charBuf,1);
-            // Below we are creating a rotating display of numbers 1-5 the user can thumb through.
-            // Example "Setpoint: 2 3 4" where prevVal = 2, voltageSetpoint = 3, nextVal = 4.
-            if (voltageSetpoint > 0)
-            {
-                // only create the previous value if voltageSetpoint is 1 or greater.
-                uint8_t prevVal = voltageSetpoint - 1;
-                dtostrf(prevVal,1,0,charBuf);
-                LcdGoToXY(5,0);
-                LcdString(charBuf,1);
-            }
-            else
-            {
-                LcdGoToXY(5,0);
-                LcdString(" ",1); // Clear the space if voltageSetpoint == 0.
-            }
-            if (voltageSetpoint < 5)
-            {
-                // only create the next value if voltageSetpoint is 4 or lesser.
-                uint8_t nextVal = voltageSetpoint + 1;
-                dtostrf(nextVal,1,0,charBuf);
-                LcdGoToXY(9,0);
-                LcdString(charBuf,1);
-            }
-            else
-            {
-                LcdGoToXY(9,0);
-                LcdString(" ",1); // Clear the space if voltageSetpoint == 5.
-            }
-            break;
-        }
-    }
+
+        xTaskDelayUntil(&xLastWakeTime, xTicksToGo);
+    } // end for(;;)
 }
 
 void vSetupPrimaryLed(void)
@@ -444,78 +545,89 @@ void vSetupPrimaryLed(void)
     PORTB &= ~(_BV(PB5));
 }
 
-// void vBlinkPrimaryLed(void)
-// {
-//     PORTB ^= _BV(PB5);
-// }
-
 void vApplicationStackOverflowHook(TaskHandle_t xTask, char* pcTaskName)
 {
     // just turn on the primary LED
     PORTB |= _BV(PB5);
 }
 
-// int main(void)
-// {
-//     static StaticTask_t xTaskControlBuffer;
-//     static StackType_t axTaskStack[configMINIMAL_STACK_SIZE];
-//     static TaskHandle_t xBlinkTaskHandle = NULL;
-
-//     vSetupPrimaryLed();
-//     vBlinkInit();
-    
-//     xBlinkTaskHandle = xTaskCreateStatic(
-//         vBlinkTask,
-//         "BLINK",
-//         sizeof(axTaskStack),
-//         NULL,
-//         mainBLINK_TASK_PRIORITY,
-//         &axTaskStack[0],
-//         &xTaskControlBuffer
-//     );
-
-//     vTaskStartScheduler();
-    
-//     return 0;
-// }
-
 void vApplicationIdleHook(void)
 {
     //nothing;
 }
 
+void vSetupMutexes(void)
+{
+    // Create each of the mutexes used in the system
+    xPhotocellVoltageMutex = xSemaphoreCreateMutexStatic(&xPhotocellVoltageMutexBuffer);
+}
+
 // Entry point of program
 int main(void)
 {
-    //StopWdt();       // Disable any WDT currently on.
-    //InitTimer0();    // Enable Timer
+    // Task Setup Vars
+    static StaticTask_t xMotorTaskControlBuffer;
+    static StackType_t axMotorTaskStack[configMINIMAL_STACK_SIZE];
+    static TaskHandle_t xAutoMotorTaskHandle = NULL;
+    static StaticTask_t xReadAdcTaskControlBuffer;
+    static StackType_t axReadAdcTaskStack[configMINIMAL_STACK_SIZE];
+    static TaskHandle_t xReadAdcTaskHandle = NULL;
+    static StaticTask_t xJoystickTaskControlBuffer;
+    static StackType_t axJoystickTaskStack[configMINIMAL_STACK_SIZE];
+    static TaskHandle_t xJoystickTaskHandle = NULL;
+    static StaticTask_t xLcdUpdateTaskControlBuffer;
+    static StackType_t axLcdUpdateTaskStack[configMINIMAL_STACK_SIZE];
+    static TaskHandle_t xLcdUpdateTaskHandle = NULL;
+
+    // One time setup functions
+    vSetupPrimaryLed(); // We will use the primary LED as a stack overflow signal
     InitAdc();		 // Enable ADCs
     LcdInitialize(); // Connect to LCD
     TwiMasterInit(); // Enable I2C
-    //sei();			 // Master interrupt bit.
-
     LcdClear();
     LcdCursorOnUnderline(); // Tracks the joystick position as cursor.
-
     MotorControlInit(); // set motor control pins for output
+    vSetupMutexes(); // Establish the mutexes
+    
+    xAutoMotorTaskHandle = xTaskCreateStatic(
+        vMotorTask,
+        "MOTOR",
+        sizeof(axMotorTaskStack),
+        NULL,
+        mainRUN_MOTOR_TASK_PRIORITY,
+        &axMotorTaskStack[0],
+        &xMotorTaskControlBuffer
+    );
+    xReadAdcTaskHandle = xTaskCreateStatic(
+        vReadAdcTask,
+        "ADC",
+        sizeof(axReadAdcTaskStack),
+        NULL,
+        mainADC_READ_TASK_PRIORITY,
+        &axReadAdcTaskStack[0],
+        &xReadAdcTaskControlBuffer
+    );
+    xJoystickTaskHandle = xTaskCreateStatic(
+        vJoystickTask,
+        "JOY",
+        sizeof(axJoystickTaskStack),
+        NULL,
+        mainJOYSTICK_TASK_PRIORITY,
+        &axJoystickTaskStack[0],
+        &xJoystickTaskControlBuffer
+    );
+    xLcdUpdateTaskHandle = xTaskCreateStatic(
+        vLcdUpdateTask,
+        "LCD",
+        sizeof(axLcdUpdateTaskStack),
+        NULL,
+        mainLCD_UPDATE_TASK_PRIORITY,
+        &axLcdUpdateTaskStack[0],
+        &xLcdUpdateTaskControlBuffer
+    );
 
-    while (1)
-    {
-        JoystickTask(); // Get joystick position every cycle
-        if (sysMode == AUTO && uiState == NAVIGATING_MENUS)
-        {
-            AutoMotorTask();
-        }
-        if (adcReadFlag == true)
-        {
-            adcReadFlag = false;
-            photocellVoltage = ReadAdc(); // Read the brightness
-        }
-        if (lcdUpdateFlag == true)
-        {
-            lcdUpdateFlag = false;
-            UserInterfaceTask(); // Update the LCD
-        }
-    }
+    vTaskStartScheduler();
+
+    // Should never return
     return 0;
 }
