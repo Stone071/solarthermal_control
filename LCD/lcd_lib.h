@@ -3,6 +3,10 @@
 // API based on 8-bit/4-bit LCD interface from Scienceprog.com
 // Modified by Zachary Stone
 
+#ifndef LCD_LIB_H
+    #define LCD_LIB_H
+#endif
+
 #include <stdint.h>
 
 void LcdInitialize(void);          //Initializes LCD

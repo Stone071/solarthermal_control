@@ -8,18 +8,24 @@
 // ###############################################
 
 // INCLUDES
-#define F_CPU 16000000UL
 #include <avr/io.h>
-#include <avr/interrupt.h>
+//#include <avr/interrupt.h>
 #include "lcd_lib.h"
-#include <avr/wdt.h>
+//#include <avr/wdt.h>
 #include <stdbool.h>
 #include <stdlib.h> // contains dtostrf();
-#include <avr/pgmspace.h>
+//#include <avr/pgmspace.h>
 #include <math.h>
-#include <stdint.h>
+//#include <stdint.h>
+#include "FreeRTOSConfig.h"
+#include "portmacro.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 // DEFINES
+// We can use the same priority as the idle task, a define controls
+// how idle and this task collide.
+#define mainBLINK_TASK_PRIORITY (tskIDLE_PRIORITY)
 // I2C communication
 #define JOY_ADDR  0x20 // i2c addr
 #define X_REG     0x03 // i2c registers
@@ -29,7 +35,7 @@
 #define READ_BIT  1    // i2c control
 // Motor Control
 #define STEP_CW   1 // motor directions
-#define STEP_CCW -1 // motor directions
+#define STEP_CCW  2 // motor directions
 #define IN1 PORTD0  // motor step pins
 #define IN2 PORTD2  // motor step pins
 #define IN3 PORTD3  // motor step pins
@@ -69,56 +75,56 @@ volatile uint16_t adcReadTimer;
 volatile bool adcReadFlag;
 volatile bool lcdUpdateFlag;
 uint16_t debounceTime;
-// All text used for display -- PROGMEM attribute places in flash
-const uint8_t voltageMsg[] PROGMEM = "V: \0";
-const uint8_t controlMsg[] PROGMEM = "Cntrl: \0";
-const uint8_t setpointMsg[] PROGMEM = "Set: \0";
-const uint8_t adjMsg[] PROGMEM = "Adjust\0";
-const uint8_t motorAdjMsgOne[] PROGMEM = "Adj shade with\0";
-const uint8_t motorAdjMsgTwo[] PROGMEM = "joystick.\0";
+// All text used for display
+const unsigned char voltageMsg[] = "V: ";
+const unsigned char controlMsg[] = "Cntrl: ";
+const unsigned char setpointMsg[] = "Set: ";
+const unsigned char adjMsg[] = "Adjust";
+const unsigned char motorAdjMsgOne[] = "Adj shade with";
+const unsigned char motorAdjMsgTwo[] = "joystick.";
 
-// StopWdt disables any already-configured watchdog
-void StopWdt(void)
-{
-    wdt_reset();                    // Reset watchdog timer
-    MCUSR &= ~(1<<WDRF);            // Shut off watchdog reset flag
-    WDTCSR |= (1<<WDCE) | (1<<WDE); // Watchdog change enable and watchdog enable
-    WDTCSR = 0x00;                  // Disable watchdog
-}
+// // StopWdt disables any already-configured watchdog
+// void StopWdt(void)
+// {
+//     wdt_reset();                    // Reset watchdog timer
+//     MCUSR &= ~_BV(WDRF);            // Shut off watchdog reset flag
+//     WDTCSR |= _BV(WDCE) | _BV(WDE); // Watchdog change enable and watchdog enable
+//     WDTCSR = 0x00;                  // Disable watchdog
+// }
 
-// InitTimer0 sets TC0 for 500us resolution.
-void InitTimer0(void)
-{
-    TCCR0A |= (1<<WGM01); // Set TC0 to CTC mode
-    OCR0A = 124;          // Count up to 124
-    TIMSK0 = (1<<OCIE0A); // Enable timer 0 compare A ISR
-    TCCR0B = 3;           // Set scaling to divide by 64 counts and start timer.
-}
+// // InitTimer0 sets TC0 for 500us resolution.
+// void InitTimer0(void)
+// {
+//     TCCR0A |= _BV(WGM01); // Set TC0 to CTC mode
+//     OCR0A = 124;          // Count up to 124
+//     TIMSK0 = _BV(OCIE0A); // Enable timer 0 compare A ISR
+//     TCCR0B = 3;           // Set scaling to divide by 64 counts and start timer.
+// }
 
-// TC0 interrupt. Executes every 500us.
-ISR(TIMER0_COMPA_vect)
-{
-    if (adcReadTimer > 0)
-    {
-        adcReadTimer--;
-    }
-    else
-    {
-        adcReadFlag = true;   // I ended up grouping these two on the same timer
-        lcdUpdateFlag = true;
-        adcReadTimer = ADC_DELAY;
-    }
-    if (debounceTime > 0)
-    {
-        debounceTime--;       // This is to control how often the joystick position is checked.
-    }                         // Otherwise the joystick provides input at full cycle speed.
-}
+// // TC0 interrupt. Executes every 500us.
+// ISR(TIMER0_COMPA_vect)
+// {
+//     if (adcReadTimer > 0)
+//     {
+//         adcReadTimer--;
+//     }
+//     else
+//     {
+//         adcReadFlag = true;   // I ended up grouping these two on the same timer
+//         lcdUpdateFlag = true;
+//         adcReadTimer = ADC_DELAY;
+//     }
+//     if (debounceTime > 0)
+//     {
+//         debounceTime--;       // This is to control how often the joystick position is checked.
+//     }                         // Otherwise the joystick provides input at full cycle speed.
+// }
 
 // MotorControlInit sets the motor control pins for output
 void MotorControlInit(void)
 {
     // Set data direction register for output on motor control pins
-    DDRD = (1<<PIND0 | 1<<PIND2 | 1<<PIND3 | 1<<PIND4);
+    DDRD = (1<<DDD0 | 1<<DDD2 | 1<<DDD3 | 1<<DDD4);
 }
 
 // StepMotor takes a direction input and steps once in that direction
@@ -127,7 +133,7 @@ void StepMotor(int direction)
     // Persistent step index
     static int8_t stepIndex = 0;
     // Successive values for PORTD to step the motor
-    static const uint8_t stepTable[4] = {(1<<IN1),(1<<IN2),(1<<IN3),(1<<IN4)};
+    static const uint8_t stepTable[4] = {_BV(IN1),_BV(IN2),_BV(IN3),_BV(IN4)};
 
     stepIndex += direction;
 
@@ -135,7 +141,7 @@ void StepMotor(int direction)
     if (stepIndex > 3) stepIndex = 0;
     else if (stepIndex < 0) stepIndex = 3;
     // Zero relevant bits before setting, then set the output
-    PORTD &= ~((1<<IN1)|(1<<IN2)|(1<<IN3)|(1<<IN4));
+    PORTD &= ~(_BV(IN1)|_BV(IN2)|_BV(IN3)|_BV(IN4));
     PORTD |= stepTable[stepIndex];
 }
 
@@ -155,41 +161,42 @@ void AutoMotorTask(void)
 // TwiMasterInit configures registers for I2C operation
 void TwiMasterInit(void)
 {
-    TWBR1 = 92; 	    // 16MHz clock; prescaler=1; SCLK=80KHz
-    TWDR1 = 0xFF;       // Default data content, SDA released
-    TWCR1 = (1<<TWEN);  // Enable TWI & Acknowledgments.
+    TWSR &= ~(_BV(TWPS1) | _BV(TWPS0)); // ensure bits for prescaler=1
+    TWBR = 42; 	       // 8MHz clock; prescaler=1; SCLK=80KHz
+    TWDR = 0xFF;       // Default data content, SDA released
+    TWCR = _BV(TWEN);  // Enable TWI & Acknowledgments.
 }
 
 // TwiRead tells the target at Address which Data we want, then reads and returns the data
 int8_t TwiRead(uint8_t Address, uint8_t Data)
 {
     // First we must write to target to tell it which data we want
-    TWCR1 = (1<<TWINT) | (1<<TWSTA) | (1<<TWEN); // Send the START condition
-    while(!(TWCR1 & (1<<TWINT)));                // Wait for TWINT to set
+    TWCR = _BV(TWINT) | _BV(TWSTA) | _BV(TWEN); // Send the START condition
+    while(!(TWCR & _BV(TWINT)));                // Wait for TWINT to set
 
-    TWDR1 = (Address<<1) | (WRITE_BIT); // Load in the address and write bit
-    TWCR1 = (1<<TWINT) | (1<<TWEN); // clear the interrupt to begin transmission
-    while(!(TWCR1 & (1<<TWINT)));   // wait for TWINT to set
+    TWDR = (Address<<1) | (WRITE_BIT); // Load in the address and write bit
+    TWCR = _BV(TWINT) | _BV(TWEN); // clear the interrupt to begin transmission
+    while(!(TWCR & _BV(TWINT)));   // wait for TWINT to set
 
-    TWDR1 = Data;					// Load data in
-    TWCR1 = (1<<TWINT) | (1<<TWEN); // clear interrupt
-    while(!(TWCR1 & (1<<TWINT)));   // wait for twint to set
+    TWDR = Data;					// Load data in
+    TWCR = _BV(TWINT) | _BV(TWEN);  // clear interrupt
+    while(!(TWCR & _BV(TWINT)));    // wait for twint to set
 
     // Instead of stopping here, we now begin a read
 
     // Now read the data
-    TWCR1 = (1<<TWINT) | (1<<TWSTA) | (1<<TWEN); // send another start condition
-    while(!(TWCR1 & (1<<TWINT)));				 // wait for TWINT
+    TWCR = _BV(TWINT) | _BV(TWSTA) | _BV(TWEN);  // send another start condition
+    while(!(TWCR & _BV(TWINT)));				 // wait for TWINT
 
-    TWDR1 = (Address<<1) | (READ_BIT);           // load in the address and read bit
-    TWCR1 = (1<<TWINT) | (1<<TWEN);              // clear twint
-    while(!(TWCR1 & (1<<TWINT)));                // wait for twint
+    TWDR = (Address<<1) | (READ_BIT);           // load in the address and read bit
+    TWCR = _BV(TWINT) | _BV(TWEN);               // clear twint
+    while(!(TWCR & _BV(TWINT)));                 // wait for twint
 
-    TWCR1 = (1<<TWINT) | (1<<TWEN);				 // clear twint
-    while (!(TWCR1 & (1<<TWINT)));				 // wait for twint
-    uint8_t readOut = TWDR1;					 // read the received value
+    TWCR = _BV(TWINT) | _BV(TWEN);				 // clear twint
+    while (!(TWCR & _BV(TWINT)));				 // wait for twint
+    uint8_t readOut = TWDR;					 // read the received value
 
-    TWCR1 = (1<<TWINT) | (1<<TWEN) | (1<<TWSTO); // transmit STOP
+    TWCR = _BV(TWINT) | _BV(TWEN) | _BV(TWSTO);  // transmit STOP
     return readOut;								 // return the readout value
 }
 
@@ -306,18 +313,18 @@ void JoystickTask(void)
 void InitAdc(void)
 {
     // ON PC4
-    ADCSRA = (1<<ADEN) | (1<<ADPS2) | (1<<ADPS1) | (1<<ADPS0);
+    ADCSRA = _BV(ADEN) | _BV(ADPS2) | _BV(ADPS1) | _BV(ADPS0);
     // ADEN enables ADC
     // ADPS is prescaler -- 111 is div by 128.
-    ADCSRA |= (1<<ADSC); // begins the conversion
+    ADCSRA |= _BV(ADSC); // begins the conversion
 }
 
 // ReadAdcChannel reads the ADC given by input channel
 uint16_t ReadAdcChannel(uint8_t channel)
 {
     ADMUX = channel;            // specify which ADC to look at
-    ADCSRA |= (1<<ADSC);        // begin a read
-    while (ADCSRA & (1<<ADSC)); // ADSC clears when read is complete. Should be 13 cycles(812ns)
+    ADCSRA |= _BV(ADSC);        // begin a read
+    while (ADCSRA & _BV(ADSC)); // ADSC clears when read is complete. Should be 13 cycles(812ns)
     return ADC;
 }
 
@@ -430,15 +437,62 @@ void UserInterfaceTask(void)
     }
 }
 
+void vSetupPrimaryLed(void)
+{
+    DDRB |= _BV(PB5);
+    // Make sure it's off to begin
+    PORTB &= ~(_BV(PB5));
+}
+
+// void vBlinkPrimaryLed(void)
+// {
+//     PORTB ^= _BV(PB5);
+// }
+
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char* pcTaskName)
+{
+    // just turn on the primary LED
+    PORTB |= _BV(PB5);
+}
+
+// int main(void)
+// {
+//     static StaticTask_t xTaskControlBuffer;
+//     static StackType_t axTaskStack[configMINIMAL_STACK_SIZE];
+//     static TaskHandle_t xBlinkTaskHandle = NULL;
+
+//     vSetupPrimaryLed();
+//     vBlinkInit();
+    
+//     xBlinkTaskHandle = xTaskCreateStatic(
+//         vBlinkTask,
+//         "BLINK",
+//         sizeof(axTaskStack),
+//         NULL,
+//         mainBLINK_TASK_PRIORITY,
+//         &axTaskStack[0],
+//         &xTaskControlBuffer
+//     );
+
+//     vTaskStartScheduler();
+    
+//     return 0;
+// }
+
+void vApplicationIdleHook(void)
+{
+    //nothing;
+}
+
 // Entry point of program
 int main(void)
 {
-    StopWdt();       // Disable any WDT currently on.
-    InitTimer0();    // Enable Timer
+    //StopWdt();       // Disable any WDT currently on.
+    //InitTimer0();    // Enable Timer
     InitAdc();		 // Enable ADCs
     LcdInitialize(); // Connect to LCD
     TwiMasterInit(); // Enable I2C
-    sei();			 // Master interrupt bit.
+    //sei();			 // Master interrupt bit.
 
     LcdClear();
     LcdCursorOnUnderline(); // Tracks the joystick position as cursor.

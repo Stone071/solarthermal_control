@@ -8,9 +8,6 @@
 // ###############################################
 
 // INCLUDES
-#ifndef F_CPU
-#define F_CPU 16000000UL
-#endif
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h> // For accessing the flash!
@@ -18,8 +15,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <util/delay.h>
+//#include <util/delay.h>
 #include <math.h>
+#include "lcd_lib.h"
 
 // DEFINES
 #define BAUD 9600
@@ -39,34 +37,34 @@
 #define LCD_CMD_SHR        0x56
 #define LCD_CMD_PREFIX     0xFE
 
-// UartOneInit initializes Uart 1 for LCD communication
-void UartOneInit(unsigned int ubrr)
+// USART_Init initializes Uart 0 for LCD communication
+void USART_Init(unsigned int ubrr)
 {
     // Set the baud rate
-    UBRR1H = (unsigned char) (ubrr>>8);
-    UBRR1L = (unsigned char) ubrr;
+    UBRR0H = (unsigned char) (ubrr>>8);
+    UBRR0L = (unsigned char) ubrr;
     // Enable TXEN1
-    UCSR1B = (1<<TXEN1);
+    UCSR0B = (1<<TXEN0);
     // Set the frame format for 8N1
     // I think this is default already.
 
-    // Setting TXEN1 completely overrides any other general I/O settings for that pin.
+    // Setting TXEN0 completely overrides any other general I/O settings for that pin.
 }
 
 // LcdInitialize initializes the UART comms then waits
 void LcdInitialize(void)
 {
     // Begin uart communication
-    UartOneInit(MYUBRR);
-    _delay_ms(500);
+    USART_Init(MYUBRR);
+    //_delay_ms(500);
 }
 
-// LcdDataWrite places a byte into UDR1 for sending and waits until it is sent
+// LcdDataWrite places a byte into UDR0 for sending and waits until it is sent
 void LcdDataWrite(uint8_t data)
 {
-    UDR1 = data;
-    loop_until_bit_is_set(UCSR1A, UDRE1);
-    // UDRE1 is flag which raises when usart 1 data register
+    UDR0 = data;
+    loop_until_bit_is_set(UCSR0A, UDRE0);
+    // UDRE0 is flag which raises when usart 0 data register
     // is empty, so data has been sent.
 }
 
@@ -75,7 +73,7 @@ void LcdClear(void)
 {
     LcdDataWrite(LCD_CMD_PREFIX);
     LcdDataWrite(LCD_CMD_CLEAR);
-    _delay_us(1500);
+    //_delay_us(1500);
 }
 
 // LcdPosHome moves the LCD control to home position
@@ -83,7 +81,7 @@ void LcdPosHome(void)
 {
     LcdDataWrite(LCD_CMD_PREFIX);
     LcdDataWrite(LCD_CMD_HOME);
-    _delay_us(1500);
+    //_delay_us(1500);
 }
 
 // LcdString sends len number of bytes from *str over LcdDataWrite
@@ -123,7 +121,7 @@ void LcdGoToXY(uint8_t x, uint8_t y)
     LcdDataWrite(LCD_CMD_PREFIX);
     LcdDataWrite(LCD_CMD_GOTO);
     LcdDataWrite(pos);
-    _delay_us(100);
+    //_delay_us(100);
 }
 
 // LcdFlashString copies a string from flash memory and displays it on screen at x,y
@@ -145,7 +143,7 @@ void LcdShiftRight(uint8_t n)
     {
         LcdDataWrite(LCD_CMD_PREFIX);
         LcdDataWrite(LCD_CMD_SHR);
-        _delay_us (100);
+        //_delay_us (100);
         i++;
     }
 }
@@ -158,7 +156,7 @@ void LcdShiftLeft(uint8_t n)
     {
         LcdDataWrite(LCD_CMD_PREFIX);
         LcdDataWrite(LCD_CMD_SHL);
-        _delay_us (100);
+        //_delay_us (100);
         i++;
     }
 }
@@ -168,7 +166,7 @@ void LcdCursorOnUnderline(void)
 {
     LcdDataWrite(LCD_CMD_PREFIX);
     LcdDataWrite(LCD_CMD_CURS_UL);
-    _delay_us(1500);
+    //_delay_us(1500);
 }
 
 // LcdCursorOnBlink makes the cursor blink
@@ -176,7 +174,7 @@ void LcdCursorOnBlink(void)
 {
     LcdDataWrite(LCD_CMD_PREFIX);
     LcdDataWrite(LCD_CMD_CURS_BL);
-    _delay_us(100);
+    //_delay_us(100);
 }
 
 // LcdCursorOff turns off the visible cursor
@@ -184,10 +182,10 @@ void LcdCursorOff(void)
 {
     LcdDataWrite(LCD_CMD_PREFIX);
     LcdDataWrite(LCD_CMD_CURS_ULOFF); // cursor underline off
-    _delay_us(1500);
+    //_delay_us(1500);
     LcdDataWrite(LCD_CMD_PREFIX);
     LcdDataWrite(LCD_CMD_CURS_BLOFF); // blinking cursor off
-    _delay_us(100);
+    //_delay_us(100);
 }
 
 // LcdBlank turns off the LCD screen
@@ -195,7 +193,7 @@ void LcdBlank(void)
 {
     LcdDataWrite(LCD_CMD_PREFIX);
     LcdDataWrite(LCD_CMD_DISP_OFF); // display off
-    _delay_us(100);
+    //_delay_us(100);
 }
 
 // LcdVisible turns on the LCD screen
@@ -203,7 +201,7 @@ void LcdVisible(void)
 {
     LcdDataWrite(LCD_CMD_PREFIX);
     LcdDataWrite(LCD_CMD_DISP_ON); // display on
-    _delay_us(100);
+    //_delay_us(100);
 }
 
 // LcdCursorLeft moves the cursor left n times
@@ -214,7 +212,7 @@ void LcdCursorLeft(uint8_t n)
     {
         LcdDataWrite(LCD_CMD_PREFIX);
         LcdDataWrite(LCD_CMD_CURS_L);
-        _delay_us (100);
+        //_delay_us (100);
         i++;
     }
 }
@@ -227,7 +225,7 @@ void LcdCursorRight(uint8_t n)
     {
         LcdDataWrite(LCD_CMD_PREFIX);
         LcdDataWrite(LCD_CMD_CURS_R);
-        _delay_us (100);
+        //_delay_us (100);
         i++;
     }
 }
